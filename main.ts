@@ -1,7 +1,9 @@
 // Pump.fun Paper Sprint bot: momentum sniper with disciplined exits.
 //
-// Buy each fresh coin once, small (0.15 SOL), as soon as the size cap allows.
-// Exit on take-profit (1.8x entry), stop-loss (0.65x entry), a trailing stop
+// Buy each fresh coin once, small (0.15 SOL), as soon as the size cap allows
+// AND its virtual price has already risen >= 5% above its creation price
+// (momentum filter: real early demand, not a dead curve). Then exit on
+// take-profit (1.8x entry), stop-loss (0.65x entry), a trailing stop
 // (peak >= 1.10x entry, sell when price falls to 0.85x peak), or a time exit
 // (1500 slots held). Fast turnover across many coins is how the entry reaches
 // the 20-distinct-mint breadth guardrail.
@@ -35,6 +37,8 @@ type OrderOut =
 
 const candidates = new Set<string>();
 const entries = new Map<string, Entry>();
+/** Virtual reserves at each coin's CreateEvent: the momentum baseline. */
+const createPrices = new Map<string, { cq: bigint; ct: bigint }>();
 let buySeq = 0;
 
 /** current >= entry * num/den, all bigint cross-multiplication. */
@@ -118,7 +122,10 @@ await runBot({
 
     // 3. Buys: register new coins from this batch's events, in chain order.
     for (const e of batch.events) {
-      if (e.event === 'CreateEvent') candidates.add(e.mint);
+      if (e.event === 'CreateEvent') {
+        candidates.add(e.mint);
+        createPrices.set(e.mint, { cq: BigInt(e.virtual_quote_reserves), ct: BigInt(e.virtual_token_reserves) });
+      }
       if (e.event === 'CompleteEvent') {
         candidates.delete(e.mint);
         entries.delete(e.mint);
@@ -138,6 +145,16 @@ await runBot({
       }
       const cap = state.maxBuyLamports(mint);
       if (cap < MIN_BUY_LAMPORTS) continue;
+      // Momentum filter: only buy coins whose virtual price already rose >= 5%
+      // above their creation price — real early demand, not a dead curve.
+      // current >= create * 105/100 <=> vq * ct * 100 >= vt * cq * 105.
+      // A coin that has not risen yet stays a candidate and may qualify later.
+      const cp = createPrices.get(mint);
+      if (cp !== undefined) {
+        const vq = curve.virtual_quote_reserves;
+        const vt = curve.virtual_token_reserves;
+        if (vt === 0n || vq * cp.ct * 100n < vt * cp.cq * 105n) continue;
+      }
       const amount = cap < STAKE_LAMPORTS ? cap : STAKE_LAMPORTS;
       if (free < amount + tx) continue;
       candidates.delete(mint);
